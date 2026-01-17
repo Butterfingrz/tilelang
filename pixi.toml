@@ -1,0 +1,49 @@
+[workspace]
+channels = ["https://srgconda.bj.bcebos.com/",
+            "https://prefix.dev/meta-forge",
+            "conda-forge",
+            "/home/jovyan/meta-forge/output",
+]
+name = "tilelang"
+platforms = ["linux-64"]
+version = "0.1.0"
+
+[tasks]
+build = "MAX_JOBS=32 rattler-build build -r recipe/recipe.yaml -m recipe/variant_config.yaml -m recipe/variants.yaml -c https://srgconda.bj.bcebos.com/ -c https://prefix.dev/meta-forge -c conda-forge -c /home/jovyan/meta-forge/output -v --experimental --keep-build --no-build-id"
+
+[system-requirements]
+cuda = "12.9"
+
+[activation]
+env = { CUDA_HOME = "$CONDA_PREFIX" }
+
+[dependencies]
+python = "3.12.*"
+cuda = "12.9.*"
+pytorch = "*"
+apache-tvm-ffi = { version = "*", channel = "https://srgconda.bj.bcebos.com/" }
+nvidia-cutlass-dsl = { version = "*", channel = "https://srgconda.bj.bcebos.com/" }
+
+ninja = "*"
+cmake = "*"
+cxx-compiler = "*"
+pybind11 = "*"
+rattler-build = "*"
+
+[pypi-dependencies]
+z3-solver = ">=4.13.0"
+
+[feature.dev.dependencies]
+pytest = ">=6.0"
+pytest-cov = ">=2.0"
+black = ">=22.0"
+flake8 = ">=4.0"
+mypy = ">=0.950"
+pre-commit = ">=3.0.0"
+ruff = ">=0.11.0"
+matplotlib = ">=3.10.5"
+pip = "*"
+
+
+[environments]
+dev = { features = ["dev"] }

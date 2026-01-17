@@ -1,0 +1,135 @@
+context:
+  name: "tilelang"
+  build_number: 0
+  version: "0.1.7.post2"
+
+
+package:
+  name: ${{ name }}
+  version: ${{ version }}
+
+source:
+  - path: ..
+    patches:
+      - conda-z3-fallback.patch  # 添加 conda Z3 回退支持 (USE_PYPI_Z3=OFF 时使用)
+
+build:
+  number: ${{ build_number }}
+  string: py${{ python | version_to_buildstring }}_cuda${{ cuda | version_to_buildstring }}_pt${{ pytorch | replace('.', '') }}_${{ hash }}_${{ build_number }}
+  python:
+    version_independent: true
+  script:
+    content:
+      - set -ex
+      - git submodule update --init --recursive
+      - |
+        # TVM/CUTLASS builds can be memory heavy; cap parallelism via variants.yaml
+        export MAX_JOBS=${{ max_build_jobs }}
+        export CMAKE_BUILD_PARALLEL_LEVEL=${{ max_build_jobs }}
+      - |
+        # Use conda-provided CUDA toolkit layout (some distributions place it under targets/)
+        if [[ -d "${BUILD_PREFIX}/targets/x86_64-linux" ]]; then
+          export CUDA_HOME="${BUILD_PREFIX}/targets/x86_64-linux"
+          export CUDAToolkit_ROOT="${BUILD_PREFIX}/targets/x86_64-linux"
+        else
+          export CUDA_HOME="${BUILD_PREFIX}"
+          export CUDAToolkit_ROOT="${BUILD_PREFIX}"
+        fi
+      - |
+        # Fix conda-forge cuda-nvcc issue: nvcc in targets/ cannot find nvcc.profile
+        # This causes "cicc: not found" error. See: https://github.com/conda-forge/cuda-nvcc-impl-feedstock/issues/9
+        if [[ -f "${BUILD_PREFIX}/bin/nvcc.profile" && -d "${BUILD_PREFIX}/targets/x86_64-linux/bin" ]]; then
+          ln -sf "${BUILD_PREFIX}/bin/nvcc.profile" "${BUILD_PREFIX}/targets/x86_64-linux/bin/nvcc.profile"
+        fi
+      - |
+        # Fix cuda-crt location: nvcc expects crt/ in bin/ but conda places it elsewhere
+        # This causes "link.stub: No such file or directory" error during device linking
+        if [[ -d "${BUILD_PREFIX}/bin/crt" && ! -e "${BUILD_PREFIX}/targets/x86_64-linux/bin/crt" ]]; then
+          ln -sf "${BUILD_PREFIX}/bin/crt" "${BUILD_PREFIX}/targets/x86_64-linux/bin/crt"
+        elif [[ -d "${BUILD_PREFIX}/targets/x86_64-linux/lib/crt" && ! -e "${BUILD_PREFIX}/targets/x86_64-linux/bin/crt" ]]; then
+          ln -sf "${BUILD_PREFIX}/targets/x86_64-linux/lib/crt" "${BUILD_PREFIX}/targets/x86_64-linux/bin/crt"
+        fi
+      - |
+        # Fix nvrtc library location: cuda-nvrtc-dev installs to $PREFIX/lib/ (host env)
+        # but CUDAToolkit_ROOT points to $BUILD_PREFIX/targets/... (build env)
+        # TVM's FindCUDA.cmake uses NO_DEFAULT_PATH, so we need symlinks
+        if [[ -f "${PREFIX}/lib/libnvrtc.so" ]]; then
+          mkdir -p "${BUILD_PREFIX}/targets/x86_64-linux/lib"
+          ln -sf "${PREFIX}/lib/libnvrtc.so" "${BUILD_PREFIX}/targets/x86_64-linux/lib/libnvrtc.so"
+          # Also link builtins library if present
+          if [[ -f "${PREFIX}/lib/libnvrtc-builtins.so" ]]; then
+            ln -sf "${PREFIX}/lib/libnvrtc-builtins.so" "${BUILD_PREFIX}/targets/x86_64-linux/lib/libnvrtc-builtins.so"
+          fi
+        fi
+      - |
+        # Force CUDA build and wire GPU arch list into CMake/scikit-build-core.
+        # Disable USE_PYPI_Z3 to use conda-provided z3 package (headers in $PREFIX/include, lib in $PREFIX/lib)
+        export CMAKE_ARGS="$CMAKE_ARGS -DUSE_CUDA=ON -DUSE_ROCM=OFF -DUSE_METAL=OFF -DCUDAToolkit_ROOT=${CUDAToolkit_ROOT} -DCMAKE_CUDA_ARCHITECTURES=${{ CMAKE_CUDA_ARCHITECTURES }} -DUSE_PYPI_Z3=OFF"
+      - pip install . -vv --no-deps --no-build-isolation
+    env:
+      CUDA_VERSION: ${{ cuda_compiler_version }}
+      TORCH_CUDA_ARCH_LIST: ${{ TORCH_CUDA_ARCH_LIST }}
+      CMAKE_GENERATOR: "Ninja"
+
+requirements:
+  build:
+    - ${{ compiler('c') }}
+    - ${{ compiler('cxx') }}
+    - ${{ compiler('cuda') }}
+    - ${{ stdlib('c') }}
+    - cmake >=3.26,<4
+    - ninja
+    - git
+    - patchelf
+
+  host:
+    # Python build backend (PEP517/scikit-build-core)
+    - python
+    - pip
+    - setuptools >=61
+    - wheel
+    - scikit-build-core
+    - cython >=3.0.0
+    - packaging
+
+    # System libs (mirrors docs/get_started/Installation.md apt deps)
+    - zlib
+    - libedit
+    - libxml2
+    - ncurses
+
+    # Native deps used during compilation
+    - cuda-libraries-dev =${{ cuda_compiler_version }}
+    - cuda-nvrtc-dev =${{ cuda_compiler_version }}  # Provides libnvrtc.so for TVM runtime compilation
+    - z3-solver >=4.13.0
+    - libz3 >=4.13.0  # Provides C++ headers (z3++.h) and native library (libz3.so)
+
+    # TileLang imports torch eagerly; keep it available for smoke tests
+    - pytorch
+    - pytorch *cuda*
+
+  run:
+    - python
+    - apache-tvm-ffi >=0.1.6,<0.2
+    - torch-c-dlpack-ext
+    - cloudpickle
+    - ml_dtypes  # conda-forge uses underscore (PyPI uses ml-dtypes with hyphen)
+    - numpy >=1.23.5
+    - psutil
+    - pytorch *cuda*
+    - tqdm >=4.62.3
+    - typing_extensions >=4.10.0
+    - z3-solver >=4.13.0
+
+tests:
+  - script:
+      - python -c "import tilelang; print(tilelang.__version__)"
+    requirements:
+      run:
+        - python
+        - apache-tvm-ffi >=0.1.6,<0.2
+        - torch-c-dlpack-ext
+        - pytorch *cuda*
+        - tqdm
+        - numpy
+        - z3-solver >=4.13.0

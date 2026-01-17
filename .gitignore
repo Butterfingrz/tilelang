@@ -123,3 +123,6 @@ maint/host_checks/logs/*
 
 # perf regression test
 .perf_regression/
+# pixi environments
+.pixi/*
+!.pixi/config.toml

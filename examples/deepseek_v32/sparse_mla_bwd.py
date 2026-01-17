@@ -22,9 +22,9 @@ def preprocess(
 
     @T.prim_func
     def preprocess_kernel(
-        O: T.Tensor(shape, dtype),
-        dO: T.Tensor(shape, dtype),
-        Delta: T.Tensor([B, S, H], accum_dtype),
+        O: T.Tensor(shape, dtype),                    # type: ignore 
+        dO: T.Tensor(shape, dtype),                   # type: ignore 
+        Delta: T.Tensor([B, S, H], accum_dtype),      # type: ignore 
     ):
         with T.Kernel(H, T.ceildiv(S, block_ND), B) as (bx, by, bz):
             o = T.alloc_fragment([block_ND, block_ND], accum_dtype)

@@ -5,11 +5,11 @@ from tilelang import language as T
 from utils import assert_tensors_similar
 
 
-@tilelang.jit(
+@tilelang.jit(       #* jit的部分会影响到最终生成的代码，out_idx的使用也会
     out_idx=[-2, -1],
     pass_configs={
-        tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
-        tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
+        tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,        #! 禁用 TMA （topk稀疏读取kv不连续，如果使用TMA需要Padd）
+        tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True, #! 禁用 warp specialization
     },
 )
 def sparse_mla_fwd(
@@ -17,12 +17,12 @@ def sparse_mla_fwd(
     dim,
     tail_dim,
     topk,
-    kv_group=1,
+    kv_group=1,     #* GQA分组数，这是用MQA的方式，因此为 1
     sm_scale=None,
     is_causal=True,
     CP0=True,
-    block_I=64,
-    num_stages=2,
+    block_I=64,     #* tile分块大小
+    num_stages=2,   #! 寄存器压力，为 2
     threads=256,
 ):
     assert dim == tilelang.math.next_power_of_2(dim), f"haven't check padding correctness yet, dim={dim}"
@@ -38,16 +38,16 @@ def sparse_mla_fwd(
     seq_len = T.dynamic("seq_len")
     seq_len_kv = T.dynamic("seq_len_kv")
 
-    head_kv = heads // kv_group
-    q_shape = [batch, seq_len, heads, dim + tail_dim]
-    kv_shape = [batch, seq_len_kv, kv_group, dim + tail_dim]
-    o_shape = [batch, seq_len, heads, dim]
-    indices_shape = [batch, seq_len, kv_group, topk]
-    lse_shape = [batch, seq_len, heads]
+    head_kv = heads // kv_group                              #! 统一定义shape
+    q_shape = [batch, seq_len, heads, dim + tail_dim]           #* （输入） 512 + 64
+    kv_shape = [batch, seq_len_kv, kv_group, dim + tail_dim]    #! （输入）注意使用 MQA 计算 Sparse Prefill (在softmax部分传入Mask实现稀疏化处理)
+    o_shape = [batch, seq_len, heads, dim]                   #* （输出）ATTN-output
+    indices_shape = [batch, seq_len, kv_group, topk]            #* （输入）已经得到的
+    lse_shape = [batch, seq_len, heads]                      #*  (输出) LSE
     indices_dtype = T.int32
     dtype = T.bfloat16
     accum_dtype = T.float32
-
+    #! Block配置
     G = kv_group
     H = head_kv
     padded_H = max(tilelang.math.next_power_of_2(head_kv), 16)
@@ -55,14 +55,15 @@ def sparse_mla_fwd(
         assert kv_group == 1, (
             "here we solve the H padding automatically, other wise you should handle Q copy and Output copy with your mask (when kv_group == 1, use g_i * padded_H:(g_i+1) * padded_H would be handled automatically)"
         )
-    BI = block_I
-    NI = tilelang.cdiv(topk, block_I)
-    D = dim
-    D_tail = tail_dim
-
+    BI = block_I                        # 64，每次处理64个KV tokens
+    NI = tilelang.cdiv(topk, block_I)   # 需要迭代的block数
+    D = dim                             # 512
+    D_tail = tail_dim                   # 64
+    #! 头复制策略 (REPLICATE_H)：当 head_kv > 64 时，将头分布到多个线程块处理，每块处理 H_per_block = min(64, padded_H) 个头
+    #! 利用 warp_group 的 分布式 SMEM 缓解反量化的 cuda core压力
     if head_kv > 64:
         assert head_kv % 64 == 0, "head_kv should be a multiple of 64"
-        REPLICATE_H = head_kv // 64
+        REPLICATE_H = head_kv // 64     #! 需要多少个64-head的block
     else:
         REPLICATE_H = 1
 
@@ -70,81 +71,137 @@ def sparse_mla_fwd(
 
     @T.prim_func
     def main(
-        Q: T.Tensor(q_shape, dtype),  # type: ignore
+        Q: T.Tensor(q_shape, dtype),  # type: ignore   
         KV: T.Tensor(kv_shape, dtype),  # type: ignore
         Indices: T.Tensor(indices_shape, indices_dtype),  # type: ignore
         Output: T.Tensor(o_shape, dtype),  # type: ignore
         Lse: T.Tensor(lse_shape, accum_dtype),  # type: ignore
     ):
         with T.Kernel(seq_len * REPLICATE_H, batch, kv_group, threads=threads) as (
-            bx,
-            by,
-            bz,
-        ):
+            bx,  #! 序列位置 + 头复制数
+            by,  #! Batch
+            bz,  #! KV组索引 (MQA=1)
+        ):  
+            #! ===== 共享内存分配 =====
             Q_shared = T.alloc_shared([H_per_block, D], dtype)
             Q_tail_shared = T.alloc_shared([H_per_block, D_tail], dtype)
+
             KV_shared = T.alloc_shared([BI, D], dtype)
             K_tail_shared = T.alloc_shared([BI, D_tail], dtype)
+
+            #* 输出缓冲区
             O_shared = T.alloc_shared([H_per_block, D], dtype)
             Lse_shared = T.alloc_shared([H_per_block], accum_dtype)
+
+            #* Causal mask
             mask = T.alloc_fragment([BI], "bool")
 
+            #! ===== 寄存器（Fragment）分配 =====
+            #* 输出累加器
             acc_o = T.alloc_fragment([H_per_block, D], accum_dtype)
+
+            #* Attention scores累加器
             acc_s = T.alloc_fragment([H_per_block, BI], accum_dtype)
             S_shared = T.alloc_shared([H_per_block, BI], dtype)
-            sumexp = T.alloc_fragment([H_per_block], accum_dtype)
-            sumexp_i = T.alloc_fragment([H_per_block], accum_dtype)
-            alpha = T.alloc_fragment([H_per_block], accum_dtype)
-            m_i = T.alloc_fragment([H_per_block], accum_dtype)
-            m_i_prev = T.alloc_fragment([H_per_block], accum_dtype)
 
-            T.fill(acc_o, 0)
-            T.fill(sumexp, 0)
-            T.fill(m_i, -(2**30))  # avoid -inf - inf to cause nan
+            #! Online Softmax相关
+            sumexp = T.alloc_fragment([H_per_block], accum_dtype)     #* 累积的exp和
+            sumexp_i = T.alloc_fragment([H_per_block], accum_dtype)   #* 当前block的exp和
+            alpha = T.alloc_fragment([H_per_block], accum_dtype)      #* 重新归一化因子
+            m_i = T.alloc_fragment([H_per_block], accum_dtype)        #* 当前最大值
+            m_i_prev = T.alloc_fragment([H_per_block], accum_dtype)   #* 之前的最大值
 
+            #* 初始化
+            T.fill(acc_o, 0)       #* 输出累加器清零
+            T.fill(sumexp, 0)      #* exp和清零
+            T.fill(m_i, -(2**30))  #* 最大值初始化为很小的负数 avoid -inf - inf to cause nan
+
+            #! 计算当前block处理的索引
             b_i, g_i = by, bz
             s_i = bx if REPLICATE_H == 1 else (bx // REPLICATE_H)
             q_i = s_i
-            max_kv_i = q_i
+            max_kv_i = q_i  #* Causal mask: 只能attend到<=q_i的KV
 
+            #! 计算当前block处理的head范围
             H0 = g_i * padded_H + (0 if REPLICATE_H == 1 else (bx % REPLICATE_H) * 64)
             H1 = H0 + H_per_block
+            # 例如：如果padded_H=128, REPLICATE_H=2
+            #   第1个block: H0=0, H1=64
+            #   第2个block: H0=64, H1=128
 
             T.copy(Q[b_i, s_i, H0:H1, :D], Q_shared)
             T.copy(Q[b_i, s_i, H0:H1, D:], Q_tail_shared)
 
+            #! ===== 主循环：遍历top-k个tokens =====
+                # i_i: 当前KV block索引（0 到 NI-1）
+                # NI = ceil(topk / BI) = ceil(2048 / 64) = 32
+                # num_stages=2: 使用2-stage pipeline
             for i_i in T.Pipelined(NI, num_stages=num_stages):
+
+                #! === 步骤1：构建Causal Mask ===
                 for bi_i in T.Parallel(BI):
+                    # 检查Indices[b_i, s_i, g_i, i_i * BI + bi_i]是否满足causal约束
                     mask[bi_i] = Indices[b_i, s_i, g_i, i_i * BI + bi_i] <= max_kv_i
+                    # mask[bi_i] = True if KV_index <= Query_index
+                    # 例如：如果当前query在位置100，则只能attend到位置<=100的KV
 
+                #! === 步骤2：加载KV到共享内存（稀疏访问）===
                 for bi_i, d_i in T.Parallel(BI, D):
-                    KV_shared[bi_i, d_i] = KV[b_i, Indices[b_i, s_i, g_i, i_i * BI + bi_i], g_i, d_i]
+                    KV_shared[bi_i, d_i] = KV[b_i,         #* batch索引
+                                             Indices[b_i, s_i, g_i, i_i * BI + bi_i], #* 从Indices读取KV位置
+                                             g_i,          #* group索引
+                                             d_i]          #* 维度索引
+                        # 关键：这里的KV访问是稀疏的，由Indices指定
+                        # 例如：Indices[0, 100, 0, :] = [99, 87, 95, 23, ...]
+                        #      则依次加载KV[0, 99, 0, :], KV[0, 87, 0, :], ...
                 for bi_i, d_i in T.Parallel(BI, D_tail):
-                    K_tail_shared[bi_i, d_i] = KV[b_i, Indices[b_i, s_i, g_i, i_i * BI + bi_i], g_i, D + d_i]
+                    K_tail_shared[bi_i, d_i] = KV[b_i,
+                                                  Indices[b_i, s_i, g_i, i_i * BI + bi_i],
+                                                  g_i, 
+                                                  D + d_i] #* tail维度从D开始
 
+                #! === 步骤3：初始化scores并应用mask ===
                 for h_i, bi_i in T.Parallel(H_per_block, BI):
-                    acc_s[h_i, bi_i] = T.if_then_else(mask[bi_i], 0, -T.infinity(acc_s.dtype))
+                    acc_s[h_i, bi_i] = T.if_then_else(mask[bi_i],   #* 如果mask=True
+                                                      0,            #* 初始化为0（正常计算）
+                                                      -T.infinity(acc_s.dtype)) #* 否则为-inf（softmax后为0)
+                #! === 步骤4：计算Attention Scores（Q @ K^T）===
+                    #* 主维度的GEMM
                 T.gemm(
-                    Q_shared,
-                    KV_shared,
-                    acc_s,
+                    Q_shared,               # [H_per_block, D]
+                    KV_shared,              # [BI, D]
+                    acc_s,                  # [H_per_block, BI] (输出，累加模式)
+                    transpose_B=True,       #* KV_shared转置为[D, BI]
+                    policy=T.GemmWarpPolicy.FullRow,
+                )                           #! FullCol: 每个warp处理完整的列维度
+
+                    #* tail维度的GEMM（累加到acc_s）
+                T.gemm(
+                    Q_tail_shared,          # [H_per_block, D_tail]
+                    K_tail_shared,          # [BI, D_tail]
+                    acc_s,                  #! [H_per_block, BI] (继续累加)
                     transpose_B=True,
                     policy=T.GemmWarpPolicy.FullRow,
                 )
-                T.gemm(
-                    Q_tail_shared,
-                    K_tail_shared,
-                    acc_s,
-                    transpose_B=True,
-                    policy=T.GemmWarpPolicy.FullRow,
-                )
-                T.copy(m_i, m_i_prev)
+                #! 现在 acc_s[h, bi] = Q[h, :] @ K[bi, :]^T (完整的512+64维)
+
+                #! === 步骤5：Online Softmax（FlashAttention核心）===
+                    #* 5a. 保存之前的最大值
+                T.copy(m_i, m_i_prev)  # m_i_prev[h]: 之前所有blocks的max(scores[h, :])
+
+                    #* 5b. 计算当前block的最大值
                 T.reduce_max(acc_s, m_i, dim=1, clear=False)
+                                    # m_i[h] = max(m_i_prev[h], max(acc_s[h, :]))
+                                    # clear=False: 不清空m_i，而是取max
+                    #* 5c. 计算重新归一化因子
                 for h_i in T.Parallel(H_per_block):
                     m_i[h_i] = T.max(m_i[h_i], m_i_prev[h_i])
+                    
+                    #* 5d. 计算当前block的softmax分子（exp(s - m)）
                 for h_i in T.Parallel(H_per_block):
                     alpha[h_i] = T.exp2((m_i_prev[h_i] - m_i[h_i]) * sm_scale)
                 for h_i, bi_i in T.Parallel(H_per_block, BI):
+                    
                     acc_s[h_i, bi_i] = T.exp2(acc_s[h_i, bi_i] * sm_scale - m_i[h_i] * sm_scale)
                 T.reduce_sum(acc_s, sumexp_i, dim=1)  # is this a accumulate operator?
                 for h_i in T.Parallel(H_per_block):
